@@ -1449,7 +1449,7 @@ class ModelManager:
             job.finished_event.set()
             self.condition.notify_all()
 
-    async def cancel_job(self, job_id: int, *, timeout: float = 15.0) -> bool:
+    async def cancel_job(self, job_id: int, *, timeout: float = 35.0) -> bool:
         """Cancel one internal generation and wait until its slot/job is released.
 
         Returns True when the job existed. A missing job is treated as already
@@ -3959,33 +3959,58 @@ async def checkpoint_backend_lines(
             iterator = response.aiter_lines()
             suspend_task: asyncio.Task[httpx.Response] | None = None
             preempt_task: asyncio.Task[bool] | None = None
-            cancel_task: asyncio.Task[bool] = asyncio.create_task(job.cancel_event.wait())
+            cancel_task: asyncio.Task[bool] | None = asyncio.create_task(
+                job.cancel_event.wait()
+            )
             line_task: asyncio.Task[str] | None = asyncio.create_task(anext(iterator))
+            # Preemption and cancellation use the same ordered checkpoint
+            # suspension barrier. The only semantic difference is what happens
+            # to the exported state: preemption retains it for resume, while
+            # cancellation discards it and terminates the logical job.
+            stop_reason: str | None = None  # None, "preempt", or "cancel"
+            cancel_suspend_failed = False
             switch_after_checkpoint = False
             resumed_blob_is_stale = False
             idle_race_checkpoint_adopted = False
 
             try:
                 while True:
-                    if (
-                        job.preemptible
+                    # Cancellation dominates preemption, but both transition the
+                    # backend through the same checkpoint suspend protocol. Never
+                    # tear down line_task while a suspend is in flight: llama-server
+                    # needs the original SSE reader alive so the private suspension
+                    # sentinel can cross the ordered barrier.
+                    if job.cancel_event.is_set():
+                        stop_reason = "cancel"
+                    elif (
+                        stop_reason is None
+                        and job.preemptible
                         and job.preempt_event.is_set()
+                    ):
+                        stop_reason = "preempt"
+
+                    if (
+                        stop_reason is not None
+                        and job.preemptible
                         and suspend_task is None
+                        and not (stop_reason == "cancel" and cancel_suspend_failed)
                     ):
                         suspend_task = asyncio.create_task(
                             _request_checkpoint_suspend(slot_id)
                         )
 
                     if (
-                        job.preemptible
+                        stop_reason is None
+                        and job.preemptible
                         and suspend_task is None
-                        and not job.preempt_event.is_set()
                         and preempt_task is None
                     ):
                         preempt_task = asyncio.create_task(job.preempt_event.wait())
 
                     assert line_task is not None
-                    wait_for: set[asyncio.Task[Any]] = {line_task, cancel_task}
+                    wait_for: set[asyncio.Task[Any]] = {line_task}
+                    if cancel_task is not None:
+                        wait_for.add(cancel_task)
                     if preempt_task is not None:
                         wait_for.add(preempt_task)
                     if suspend_task is not None and not suspend_task.done():
@@ -3995,62 +4020,109 @@ async def checkpoint_backend_lines(
                         wait_for, return_when=asyncio.FIRST_COMPLETED
                     )
 
-                    if cancel_task in done and job.cancel_event.is_set():
-                        # Cancellation is terminal, unlike checkpoint preemption.
-                        # It is therefore safe to abort the outstanding line read;
-                        # the outer finally closes the HTTP response before the job
-                        # is released to the scheduler.
-                        raise asyncio.CancelledError
+                    if cancel_task is not None and cancel_task in done:
+                        cancel_task = None
+                        if job.cancel_event.is_set():
+                            stop_reason = "cancel"
+                            if preempt_task is not None and not preempt_task.done():
+                                preempt_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await preempt_task
+                            preempt_task = None
+                            if (
+                                job.preemptible
+                                and suspend_task is None
+                                and not cancel_suspend_failed
+                            ):
+                                suspend_task = asyncio.create_task(
+                                    _request_checkpoint_suspend(slot_id)
+                                )
 
                     if preempt_task is not None and preempt_task in done:
                         preempt_task = None
-                        if job.preemptible and suspend_task is None:
+                        if stop_reason is None:
+                            stop_reason = "preempt"
+                        if (
+                            stop_reason == "preempt"
+                            and job.preemptible
+                            and suspend_task is None
+                        ):
                             suspend_task = asyncio.create_task(
                                 _request_checkpoint_suspend(slot_id)
                             )
 
                     # Export failure leaves the original generation viable by
-                    # checkpoint-v1 contract. Disable further attempts and keep
-                    # consuming the same response rather than killing state.
+                    # checkpoint-v1 contract. For preemption, disable further
+                    # checkpoint attempts and keep serving the generation. For a
+                    # terminal cancellation, keep draining the backend stream
+                    # without yielding it to the disconnected client; this avoids
+                    # orphaning llama-server even when this request cannot be
+                    # checkpoint-cancelled.
                     if suspend_task is not None and suspend_task.done():
                         try:
                             suspend_result = suspend_task.result()
                         except (httpx.HTTPError, asyncio.TimeoutError) as e:
-                            await MODEL_MANAGER.mark_unpreemptible(
-                                job, f"suspend request failed: {e}"
-                            )
+                            if stop_reason == "cancel":
+                                print(
+                                    f"WARNING: checkpoint cancellation failed for model "
+                                    f"{job.model_name!r}, job {job.id}: {e}; draining "
+                                    f"generation to completion",
+                                    flush=True,
+                                )
+                                cancel_suspend_failed = True
+                            else:
+                                await MODEL_MANAGER.mark_unpreemptible(
+                                    job, f"suspend request failed: {e}"
+                                )
                             suspend_task = None
                         else:
                             if suspend_result.status_code >= 400:
                                 message = await _response_error_text(suspend_result)
-                                await MODEL_MANAGER.mark_unpreemptible(
-                                    job,
-                                    f"suspend HTTP {suspend_result.status_code}: {message}",
-                                )
-                                suspend_task = None
-                            elif (
-                                _checkpoint_response_kind(suspend_result) == "idle"
-                                and not idle_race_checkpoint_adopted
-                            ):
-                                # The generation finished between preemption being
-                                # signalled and action=suspend reaching llama-server.
-                                # Preserve the now-idle slot and let the normal
-                                # stream finish; no generation sentinel is expected.
-                                blob = bytes(suspend_result.content)
-                                version = suspend_result.headers.get(
-                                    "X-Llama-Checkpoint-Version"
-                                )
-                                if blob and version in (None, "1"):
-                                    await MODEL_MANAGER.remember_idle_checkpoint(
-                                        job.model_name, slot_id, blob
-                                    )
-                                    idle_race_checkpoint_adopted = True
+                                if stop_reason == "cancel":
                                     print(
-                                        f"Generation for model {job.model_name!r}, "
-                                        f"job {job.id} completed before suspend; saved "
-                                        f"{len(blob)} byte idle KV checkpoint",
+                                        f"WARNING: checkpoint cancellation for model "
+                                        f"{job.model_name!r}, job {job.id} returned HTTP "
+                                        f"{suspend_result.status_code}: {message}; draining "
+                                        f"generation to completion",
                                         flush=True,
                                     )
+                                    cancel_suspend_failed = True
+                                else:
+                                    await MODEL_MANAGER.mark_unpreemptible(
+                                        job,
+                                        f"suspend HTTP {suspend_result.status_code}: {message}",
+                                    )
+                                suspend_task = None
+                            elif _checkpoint_response_kind(suspend_result) == "idle":
+                                # The generation finished between the stop request
+                                # and action=suspend reaching llama-server. For
+                                # cancellation that is already terminal success;
+                                # for preemption preserve the reusable idle KV and
+                                # let the normal stream finish.
+                                if stop_reason == "cancel":
+                                    print(
+                                        f"Cancelled model {job.model_name!r}, job {job.id}: "
+                                        f"slot {slot_id} was already idle",
+                                        flush=True,
+                                    )
+                                    job.checkpoint = None
+                                    return
+                                if not idle_race_checkpoint_adopted:
+                                    blob = bytes(suspend_result.content)
+                                    version = suspend_result.headers.get(
+                                        "X-Llama-Checkpoint-Version"
+                                    )
+                                    if blob and version in (None, "1"):
+                                        await MODEL_MANAGER.remember_idle_checkpoint(
+                                            job.model_name, slot_id, blob
+                                        )
+                                        idle_race_checkpoint_adopted = True
+                                        print(
+                                            f"Generation for model {job.model_name!r}, "
+                                            f"job {job.id} completed before suspend; saved "
+                                            f"{len(blob)} byte idle KV checkpoint",
+                                            flush=True,
+                                        )
 
                     if line_task not in done:
                         continue
@@ -4102,13 +4174,15 @@ async def checkpoint_backend_lines(
                             suspend_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await suspend_task
-                        yield line
+                        if stop_reason != "cancel":
+                            yield line
                         return
 
                     try:
                         obj = json.loads(data_text)
                     except json.JSONDecodeError:
-                        yield line
+                        if stop_reason != "cancel":
+                            yield line
                         line_task = asyncio.create_task(anext(iterator))
                         continue
 
@@ -4134,6 +4208,12 @@ async def checkpoint_backend_lines(
                             raise CheckpointError(
                                 f"checkpoint sentinel arrived but export response failed: {e}"
                             ) from e
+                        # Cancellation is terminal and dominates an in-flight
+                        # scheduler preemption even if it arrived in the tiny
+                        # race between asyncio.wait() and this sentinel.
+                        if job.cancel_event.is_set():
+                            stop_reason = "cancel"
+
                         if suspended.status_code >= 400:
                             message = await _response_error_text(suspended)
                             raise CheckpointError(
@@ -4156,6 +4236,19 @@ async def checkpoint_backend_lines(
                                 f"unsupported llama checkpoint version {version!r}"
                             )
 
+                        if stop_reason == "cancel":
+                            # Same safe backend transition as preemption, but this
+                            # logical job is terminal: deliberately discard the
+                            # exported continuation state instead of resuming it.
+                            job.checkpoint = None
+                            print(
+                                f"Cancelled model {job.model_name!r}, job {job.id} "
+                                f"at checkpoint boundary; discarded {len(blob)} "
+                                f"checkpoint byte(s)",
+                                flush=True,
+                            )
+                            return
+
                         job.checkpoint = blob
                         # Keep the explicit slot reservation with the logical
                         # job. Resume v1 should restore the saved slot id; if a
@@ -4176,11 +4269,15 @@ async def checkpoint_backend_lines(
                         resumed_blob_is_stale = True
 
                     # Any __verbose metadata is scheduling-only. The translators
-                    # construct fresh Ollama objects and do not expose it.
-                    yield line
+                    # construct fresh Ollama objects and do not expose it. Once
+                    # cancellation is pending, continue consuming only to drive
+                    # the checkpoint barrier (or safely drain an unsupported
+                    # generation); do not enqueue more output for the dead client.
+                    if stop_reason != "cancel":
+                        yield line
                     line_task = asyncio.create_task(anext(iterator))
             finally:
-                if not cancel_task.done():
+                if cancel_task is not None and not cancel_task.done():
                     cancel_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await cancel_task
@@ -4258,14 +4355,50 @@ async def buffered_backend_lines(
                 raise value
             return
     finally:
+        outer_cancelled = False
         if not task.done():
-            task.cancel()
+            # Front-end teardown is a logical cancellation request, not a reason
+            # to kill the backend pump. checkpoint_backend_lines() must keep its
+            # SSE reader alive until llama-server crosses the same ordered
+            # suspension barrier used for scheduler preemption.
+            job.cancel_event.set()
+            while not task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=35.0
+                    )
+                except asyncio.TimeoutError:
+                    # _request_checkpoint_suspend() itself has a 30s inactivity
+                    # timeout. If checkpoint cancellation is unsupported or fails,
+                    # checkpoint_backend_lines() deliberately drains the generation
+                    # to its natural end. Do not hard-cancel that pump: doing so
+                    # would recreate the original orphaned llama-server generation.
+                    print(
+                        f"WARNING: model {job.model_name!r}, job {job.id} is still "
+                        f"finishing backend cancellation; continuing to wait",
+                        flush=True,
+                    )
+                    continue
+                except asyncio.CancelledError:
+                    # Starlette may cancel the response task while this async
+                    # generator is closing. Do not let that second cancellation
+                    # tear down the checkpoint SSE reader. Temporarily consume
+                    # the cancellation, finish backend cleanup, then re-raise it
+                    # after the ModelJob is safe to release.
+                    outer_cancelled = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                    continue
+
         with contextlib.suppress(asyncio.CancelledError):
             await task
         aclose = getattr(source, "aclose", None)
         if aclose is not None:
             with contextlib.suppress(Exception):
                 await aclose()
+        if outer_cancelled:
+            raise asyncio.CancelledError
 
 
 def backend_error_message(data: Any) -> str:
@@ -6008,5 +6141,4 @@ if __name__ == "__main__":
         uvicorn.run(public_app, host=PROXY_HOST, port=PROXY_PORT, log_level="info")
     finally:
         _close_full_llama_responses_log()
-
 
