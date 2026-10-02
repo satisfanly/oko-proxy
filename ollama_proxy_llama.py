@@ -24,8 +24,10 @@ Managed back-end API (llama-server):
     http://127.0.0.1:8080
 
 The proxy loads model definitions from a YAML file. Model names are the
-top-level keys directly. Configuration is strict about field names: unknown
-fields are rejected. `cmd` is required. Omitted generation controls stay omitted
+top-level keys directly. Before YAML parsing, `%max_free_ram%` is expanded
+anywhere in the file to Linux MemAvailable minus a 5 GiB reserve, expressed in
+MiB (suitable for llama-server `--cache-ram`). Configuration is strict about
+field names: unknown fields are rejected. `cmd` is required. Omitted generation controls stay omitted
 at the llama-server request boundary unless the YAML explicitly configures them;
 the shim does not silently replace backend/model sampler defaults. `external-chain` is an optional list of shell
 command strings. All configured chain programs are started at proxy startup and
@@ -360,12 +362,53 @@ def _require_number(model_name: str, field: str, value: Any) -> float:
     return number
 
 
+MAX_FREE_RAM_RESERVE_MIB = 5 * 1024
+
+
+def _max_free_ram_mib() -> int:
+    """Return Linux MemAvailable minus a 5 GiB safety reserve, in MiB."""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as f:
+            for line in f:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    break
+                available_kib = int(parts[1])
+                available_mib = available_kib // 1024
+                return max(0, available_mib - MAX_FREE_RAM_RESERVE_MIB)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot determine available RAM from /proc/meminfo: {e}") from e
+
+    raise ValueError("cannot determine available RAM: /proc/meminfo has no MemAvailable entry")
+
+
+CONFIG_VARIABLE_RESOLVERS = {
+    "%max_free_ram%": _max_free_ram_mib,
+}
+
+
+def _expand_config_variables(text: str) -> str:
+    """Expand proxy-owned variables in raw YAML before YAML parsing.
+
+    Expansion happens on the raw file so a variable can appear anywhere, including
+    inside command strings or as a complete unquoted scalar. RAM variables are
+    rendered in MiB because llama-server --cache-ram expects MiB.
+    """
+    for variable, resolver in CONFIG_VARIABLE_RESOLVERS.items():
+        if variable in text:
+            text = text.replace(variable, str(resolver()))
+    return text
+
+
 def load_models_config(path: str | Path) -> dict[str, ModelConfig]:
     config_path = Path(path).expanduser().resolve()
     try:
-        with config_path.open("r", encoding="utf-8") as f:
-            raw = yaml.load(f, Loader=StrictConfigLoader)
-    except (OSError, yaml.YAMLError) as e:
+        config_text = config_path.read_text(encoding="utf-8")
+        config_text = _expand_config_variables(config_text)
+        raw = yaml.load(config_text, Loader=StrictConfigLoader)
+    except (OSError, yaml.YAMLError, ValueError) as e:
         raise ValueError(f"cannot read models config {str(config_path)!r}: {e}") from e
 
     if not isinstance(raw, dict) or not raw:
@@ -6141,4 +6184,5 @@ if __name__ == "__main__":
         uvicorn.run(public_app, host=PROXY_HOST, port=PROXY_PORT, log_level="info")
     finally:
         _close_full_llama_responses_log()
+
 
