@@ -1058,7 +1058,7 @@ class ModelManager:
                 )
                 continue
             version = response.headers.get("X-Llama-Checkpoint-Version")
-            if version not in (None, "1"):
+            if version not in (None, "1", "2"):
                 print(
                     f"WARNING: unsupported idle checkpoint version {version!r} for "
                     f"model {model_name!r} slot {slot_id}",
@@ -4097,10 +4097,11 @@ async def checkpoint_backend_lines(
                     # Export failure leaves the original generation viable by
                     # checkpoint-v1 contract. For preemption, disable further
                     # checkpoint attempts and keep serving the generation. For a
-                    # terminal cancellation, keep draining the backend stream
-                    # without yielding it to the disconnected client; this avoids
-                    # orphaning llama-server even when this request cannot be
-                    # checkpoint-cancelled.
+                    # terminal cancellation, however, the caller is already gone:
+                    # abort this HTTP stream instead of draining generation to EOS.
+                    # Closing the stream restores ordinary llama-server disconnect
+                    # cancellation semantics and, critically, does not leave the
+                    # proxy task pinned to a generation nobody can consume.
                     if suspend_task is not None and suspend_task.done():
                         try:
                             suspend_result = suspend_task.result()
@@ -4108,11 +4109,12 @@ async def checkpoint_backend_lines(
                             if stop_reason == "cancel":
                                 print(
                                     f"WARNING: checkpoint cancellation failed for model "
-                                    f"{job.model_name!r}, job {job.id}: {e}; draining "
-                                    f"generation to completion",
+                                    f"{job.model_name!r}, job {job.id}: {e}; aborting "
+                                    f"backend stream",
                                     flush=True,
                                 )
                                 cancel_suspend_failed = True
+                                return
                             else:
                                 await MODEL_MANAGER.mark_unpreemptible(
                                     job, f"suspend request failed: {e}"
@@ -4125,11 +4127,12 @@ async def checkpoint_backend_lines(
                                     print(
                                         f"WARNING: checkpoint cancellation for model "
                                         f"{job.model_name!r}, job {job.id} returned HTTP "
-                                        f"{suspend_result.status_code}: {message}; draining "
-                                        f"generation to completion",
+                                        f"{suspend_result.status_code}: {message}; aborting "
+                                        f"backend stream",
                                         flush=True,
                                     )
                                     cancel_suspend_failed = True
+                                    return
                                 else:
                                     await MODEL_MANAGER.mark_unpreemptible(
                                         job,
@@ -4155,7 +4158,7 @@ async def checkpoint_backend_lines(
                                     version = suspend_result.headers.get(
                                         "X-Llama-Checkpoint-Version"
                                     )
-                                    if blob and version in (None, "1"):
+                                    if blob and version in (None, "1", "2"):
                                         await MODEL_MANAGER.remember_idle_checkpoint(
                                             job.model_name, slot_id, blob
                                         )
@@ -4274,7 +4277,7 @@ async def checkpoint_backend_lines(
                                 "llama-server returned an empty checkpoint blob"
                             )
                         version = suspended.headers.get("X-Llama-Checkpoint-Version")
-                        if version not in (None, "1"):
+                        if version not in (None, "1", "2"):
                             raise CheckpointError(
                                 f"unsupported llama checkpoint version {version!r}"
                             )
@@ -4412,10 +4415,9 @@ async def buffered_backend_lines(
                     )
                 except asyncio.TimeoutError:
                     # _request_checkpoint_suspend() itself has a 30s inactivity
-                    # timeout. If checkpoint cancellation is unsupported or fails,
-                    # checkpoint_backend_lines() deliberately drains the generation
-                    # to its natural end. Do not hard-cancel that pump: doing so
-                    # would recreate the original orphaned llama-server generation.
+                    # timeout. Give checkpoint_backend_lines() a little longer to
+                    # observe that failure and close the backend response. Do not
+                    # cancel the pump here: it owns the response iterator teardown.
                     print(
                         f"WARNING: model {job.model_name!r}, job {job.id} is still "
                         f"finishing backend cancellation; continuing to wait",
@@ -6061,6 +6063,17 @@ async def proxy_user_generation_request(request: Request):
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+        except httpx.HTTPError as e:
+            # Response headers have already been sent at this point, so propagating
+            # an upstream reset/read error through StreamingResponse can only tear
+            # down the downstream transport. Treat it as an interrupted upstream
+            # stream: log the failure and finish the client response with clean EOF.
+            print(
+                f"WARNING: external-chain stream for model {model_name!r} ended "
+                f"abnormally: {e}; closing downstream stream cleanly",
+                flush=True,
+            )
+            return
         finally:
             await upstream.aclose()
             await release_once()
@@ -6184,5 +6197,4 @@ if __name__ == "__main__":
         uvicorn.run(public_app, host=PROXY_HOST, port=PROXY_PORT, log_level="info")
     finally:
         _close_full_llama_responses_log()
-
 

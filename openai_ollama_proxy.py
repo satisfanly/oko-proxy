@@ -210,7 +210,7 @@ def extract_text_content(content: Any, *, allow_images: bool = False) -> tuple[s
             continue
         if typ in {"image_url", "input_image"}:
             if not allow_images:
-                raise ProxyError("Images are only supported in user messages", param="messages")
+                raise ProxyError("Images are not supported in this content position", param="messages")
             image_url = part.get("image_url")
             if isinstance(image_url, dict):
                 url = image_url.get("url")
@@ -654,14 +654,42 @@ def responses_input_to_messages(body: JSON) -> list[JSON]:
         if typ == "function_call_output":
             call_id = item.get("call_id")
             output = item.get("output", "")
-            if not isinstance(output, str):
-                output = json_dumps(output)
-            msg = {"role": "tool", "content": output}
+
+            # Responses API function outputs may be either a string or a list of
+            # input_text/input_image/input_file content parts. Programmer's
+            # read_image tool uses the multimodal form. Preserve image bytes
+            # instead of JSON-stringifying the whole content array.
+            tool_images: list[str] = []
+            if isinstance(output, str):
+                output_text = output
+            elif isinstance(output, list):
+                output_text, tool_images = extract_text_content(output, allow_images=True)
+            else:
+                # Be liberal with non-standard compatible clients that return a
+                # JSON value here, while keeping standards-compliant arrays
+                # multimodal.
+                output_text = json_dumps(output)
+
+            msg: JSON = {"role": "tool", "content": output_text}
+            tool_name: str | None = None
             if isinstance(call_id, str) and call_id:
                 msg["tool_call_id"] = call_id
                 if call_id in call_names:
-                    msg["tool_name"] = call_names[call_id]
+                    tool_name = call_names[call_id]
+                    msg["tool_name"] = tool_name
+            if tool_name is None and isinstance(item.get("name"), str):
+                tool_name = item["name"]
+                msg["tool_name"] = tool_name
             messages.append(msg)
+
+            if tool_images:
+                # Ollama accepts `images` on Message, but as of 2026 vision
+                # models do not reliably consume images attached to role=tool.
+                # Inject a following user image message so multimodal tool
+                # outputs (notably Programmer read_image) are actually visible
+                # to the model while retaining the correlated tool result above.
+                label = f"Image output from tool {tool_name}." if tool_name else "Image output from tool call."
+                messages.append({"role": "user", "content": label, "images": tool_images})
             continue
 
         if typ == "reasoning":
@@ -686,9 +714,24 @@ def responses_usage(ollama: JSON) -> JSON:
     prompt = int(ollama.get("prompt_eval_count") or 0)
     output = int(ollama.get("eval_count") or 0)
     cached = int(ollama.get("prompt_eval_cached_count") or 0)
+
+    # OpenAI's current Responses schema requires both detail objects and, in
+    # particular, cache_write_tokens + cached_tokens on input details and
+    # reasoning_tokens on output details. Ollama currently reports cache hits
+    # but not cache writes or reasoning-token accounting separately, so use 0
+    # for fields for which there is no native counter. Keep forward-compatible
+    # aliases in case Ollama adds a write counter later.
+    cache_write = int(
+        ollama.get("prompt_eval_cache_write_count")
+        or ollama.get("cache_write_count")
+        or 0
+    )
     return {
         "input_tokens": prompt,
-        "input_tokens_details": {"cached_tokens": cached},
+        "input_tokens_details": {
+            "cache_write_tokens": cache_write,
+            "cached_tokens": cached,
+        },
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": prompt + output,
