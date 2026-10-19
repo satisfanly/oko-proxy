@@ -662,7 +662,7 @@ def main() -> int:
         description="Sniff plaintext Ollama requests and streaming responses"
     )
     ap.add_argument("-i", "--iface", default="lo", help="capture interface")
-    ap.add_argument("-p", "--port", type=int, default=11434, help="Ollama TCP port")
+    ap.add_argument("-p", "--port", type=int, default=11436, help="Ollama TCP port")
     ap.add_argument("--requests", action="store_true", help="pretty-print HTTP requests")
     ap.add_argument("--json", action="store_true", help="print every response JSON event")
     ap.add_argument("--debug", action="store_true", help="print packet/parser diagnostics")
