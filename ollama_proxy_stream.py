@@ -21,21 +21,29 @@ Incoming JSON requests containing ``"stream": false`` are sent upstream with
 ``"stream": true``. The streamed upstream response is accumulated and rebuilt
 into the corresponding non-streaming JSON response.
 
-Every other request, including requests with ``"stream": true`` or without a
-``stream`` field, is proxied byte-for-byte as a normal streaming reverse proxy.
+Other requests are proxied unchanged at the HTTP payload level. If a top-level
+``"stream": true`` appears early in a JSON upload, the upload is forwarded
+immediately; otherwise it is spooled while mode is determined. Supplying
+``X-Ollama-Proxy-Passthrough: true`` guarantees upload streaming and bypasses
+flag inspection. Responses in passthrough mode are always streamed.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import json
 import logging
 import os
+import tempfile
+import gzip
+import zlib
+from contextlib import suppress
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, DummyCookieJar, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, DummyCookieJar, TCPConnector, web
 from multidict import CIMultiDict
 
 LOG = logging.getLogger("ollama-stream-proxy")
@@ -64,10 +72,10 @@ def filtered_request_headers(
 ) -> CIMultiDict[str]:
     blocked = HOP_BY_HOP_HEADERS | connection_tokens(headers) | {
         "host",
-        "content-length",
         "expect",
     }
     if transformed:
+        blocked.add("content-length")  # JSON is reserialized; size changes.
         # The transformed response must be readable by the proxy. Avoid an
         # encoded NDJSON/SSE body whose Content-Encoding would then need to be
         # decoded and reconstructed.
@@ -89,7 +97,10 @@ def filtered_response_headers(
 ) -> CIMultiDict[str]:
     blocked = HOP_BY_HOP_HEADERS | connection_tokens(headers)
     if transformed:
-        blocked |= {"content-length", "content-type", "content-encoding"}
+        blocked |= {
+            "content-length", "content-type", "content-encoding",
+            "etag", "content-range", "content-md5", "digest",
+        }
 
     result: CIMultiDict[str] = CIMultiDict()
     for name, value in headers.items():
@@ -562,149 +573,320 @@ def aggregate_streamed_response(
     return terminal
 
 
+# The request body is arbitrary JSON: a top-level "stream" key may appear late,
+# after megabytes of model input. This small scanner recognizes a top-level flag
+# without parsing or retaining the entire JSON document. It ignores string
+# contents and nested objects. Early stream=true allows request-body passthrough.
+class StreamFlagProbe:
+    def __init__(self) -> None:
+        self.depth = 0
+        self.string = False
+        self.escaped = False
+        self.key_bytes: bytearray | None = None
+        self.expect_key = False
+        self.stream_key = False
+        self.awaiting_literal = False
+        self.literal = bytearray()
+        self.result: bool | None = None
+
+    def feed(self, data: bytes) -> bool | None:
+        for ch in data:
+            if self.awaiting_literal:
+                if ch in b" \t\r\n" and not self.literal:
+                    continue
+                self.literal.append(ch)
+                if self.literal == b"true":
+                    self.result = True
+                    return True
+                if self.literal == b"false":
+                    self.result = False
+                    return False
+                if not (b"true".startswith(self.literal) or b"false".startswith(self.literal)):
+                    self.awaiting_literal = False
+                else:
+                    continue
+                # Unexpected stream value: continue structural tracking below.
+
+            if self.string:
+                if self.escaped:
+                    self.escaped = False
+                    if self.key_bytes is not None:
+                        self.key_bytes.extend((92, ch))
+                elif ch == 92:  # backslash
+                    self.escaped = True
+                elif ch == 34:  # quote
+                    self.string = False
+                    if self.key_bytes is not None:
+                        try:
+                            self.stream_key = (
+                                json.loads(b'"' + self.key_bytes + b'"') == "stream"
+                            )
+                        except (UnicodeDecodeError, ValueError):
+                            self.stream_key = False
+                        self.key_bytes = None
+                        self.expect_key = False
+                elif self.key_bytes is not None:
+                    # Avoid allocating unbounded memory for a very long key.
+                    if len(self.key_bytes) < 256:
+                        self.key_bytes.append(ch)
+                    else:
+                        self.key_bytes = None
+                continue
+
+            if ch == 34:
+                self.string = True
+                if self.depth == 1 and self.expect_key:
+                    self.key_bytes = bytearray()
+                continue
+            if ch in (123, 91):  # { [
+                self.depth += 1
+                if self.depth == 1 and ch == 123:
+                    self.expect_key = True
+            elif ch in (125, 93):  # } ]
+                self.depth -= 1
+            elif self.depth == 1 and ch == 44:  # comma
+                self.expect_key = True
+                self.stream_key = False
+            elif self.depth == 1 and ch == 58 and self.stream_key:  # colon
+                self.awaiting_literal = True
+                self.literal.clear()
+        return None
+
+
+class RequestTooLarge(Exception):
+    pass
+
+
 class OllamaProxy:
-    def __init__(self, upstream: str) -> None:
+    """Forward HTTP requests, internally stream/rebuild only stream:false."""
+
+    def __init__(
+        self,
+        upstream: str,
+        *,
+        pool_limit: int = 0,
+        connect_timeout: float = 30,
+        max_buffered_request: int = 1024**3,
+        spool_memory: int = 2 * 1024**2,
+        max_aggregate_response: int = 128 * 1024**2,
+        max_transform_request: int = 64 * 1024**2,
+    ) -> None:
         self.upstream = upstream.rstrip("/")
+        self.pool_limit = pool_limit
+        self.connect_timeout = connect_timeout
+        self.max_buffered_request = max_buffered_request
+        self.spool_memory = spool_memory
+        self.max_aggregate_response = max_aggregate_response
+        self.max_transform_request = max_transform_request
         self.session: ClientSession | None = None
 
     async def start(self, _app: web.Application) -> None:
-        timeout = ClientTimeout(
-            total=None,
-            connect=30,
-            sock_connect=30,
-            sock_read=None,
-        )
         self.session = ClientSession(
-            timeout=timeout,
+            connector=TCPConnector(limit=self.pool_limit),
+            timeout=ClientTimeout(
+                total=None,
+                connect=None,        # Don't time out only because the pool is busy.
+                sock_connect=self.connect_timeout,
+                sock_read=None,      # LLM generation may take a long time.
+            ),
             cookie_jar=DummyCookieJar(),
-            auto_decompress=False,
+            auto_decompress=False,   # Raw compressed bytes stay raw in passthrough.
         )
 
     async def stop(self, _app: web.Application) -> None:
-        if self.session is not None:
+        if self.session:
             await self.session.close()
             self.session = None
 
-    async def handle(self, request: web.Request) -> web.StreamResponse:
-        assert self.session is not None
+    async def _request_body(self, request: web.Request) -> tuple[bool, Any, Any]:
+        """Return (transform_response, payload, owned_spool).
 
-        original_body = await request.read()
-        request_json = parse_json_request(original_body)
-        transformed = request_json is not None and request_json.get("stream") is False
+        Try to discover stream:true while the upload is still arriving. Until
+        the flag is known, spool the bytes to memory/disk instead of retaining
+        unlimited RAM. If stream:true appears, relay the buffered prefix then
+        the remaining upload progressively. Otherwise read the completed body
+        to decide if stream:false requires conversion.
 
-        if transformed:
+        For guaranteed request-body streaming even if the JSON stream flag is
+        last, send X-Ollama-Proxy-Passthrough: true. This is a proxy-only header.
+        """
+        if request.headers.get("X-Ollama-Proxy-Passthrough", "").lower() in {"1", "true", "yes"}:
+            return False, request.content.iter_chunked(64 * 1024), None
+
+        spool = tempfile.SpooledTemporaryFile(max_size=self.spool_memory)
+        size = 0
+        probe = StreamFlagProbe()
+        owned_by_handler = False
+
+        async def forward_spool(*, remainder: bool):
+            spool.seek(0)
+            while (part := spool.read(64 * 1024)):
+                yield part
+            if remainder:
+                async for part in request.content.iter_chunked(64 * 1024):
+                    yield part
+
+        try:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                size += len(chunk)
+                if self.max_buffered_request and size > self.max_buffered_request:
+                    raise RequestTooLarge(
+                        f"Could not determine streaming mode within {self.max_buffered_request} bytes; "
+                        "send X-Ollama-Proxy-Passthrough: true for large streaming uploads"
+                    )
+                spool.write(chunk)
+                if probe.feed(chunk) is True:
+                    owned_by_handler = True
+                    return False, forward_spool(remainder=True), spool
+                # On stream:false we need the complete body to modify the JSON.
+
+            if probe.result is not False:
+                # If no stream:false was found, no JSON mutation is needed.
+                # Large bodies remain on disk; do not read them back into RAM.
+                if size <= self.spool_memory:
+                    spool.seek(0)
+                    return False, spool.read(), None
+                owned_by_handler = True
+                return False, forward_spool(remainder=False), spool
+
+            if self.max_transform_request and size > self.max_transform_request:
+                raise RequestTooLarge(
+                    f"stream:false JSON request exceeds transformation limit "
+                    f"({self.max_transform_request} bytes)"
+                )
+            spool.seek(0)
+            body = spool.read()
+            request_json = parse_json_request(body)
+            if request_json is None or request_json.get("stream") is not False:
+                return False, body, None
+
             upstream_json = copy.deepcopy(request_json)
             upstream_json["stream"] = True
-
-            # Force usage into OpenAI-compatible streamed responses so the
-            # reconstructed non-stream response retains its usage object.
             if request.path.endswith(("/chat/completions", "/completions")):
-                stream_options = upstream_json.get("stream_options")
-                if not isinstance(stream_options, dict):
-                    stream_options = {}
-                    upstream_json["stream_options"] = stream_options
-                stream_options["include_usage"] = True
+                options = upstream_json.get("stream_options")
+                if not isinstance(options, dict):
+                    options = {}
+                    upstream_json["stream_options"] = options
+                options["include_usage"] = True
+            return True, compact_json_bytes(upstream_json), None
+        finally:
+            if not owned_by_handler:
+                spool.close()
 
-            upstream_body = compact_json_bytes(upstream_json)
-        else:
-            upstream_body = original_body
+    async def handle(self, request: web.Request) -> web.StreamResponse:
+        assert self.session is not None
+        try:
+            transformed, upstream_body, owned_spool = await self._request_body(request)
+        except RequestTooLarge as exc:
+            return web.json_response({"error": str(exc)}, status=413)
+        except (ConnectionError, asyncio.CancelledError):
+            raise
 
-        upstream_url = self.upstream + request.raw_path
-        request_headers = filtered_request_headers(
-            request.headers,
-            transformed=transformed,
+        LOG.debug(
+            "%s %s: %s, inbound Content-Length=%s",
+            request.method, request.raw_path,
+            "rebuild" if transformed else "passthrough",
+            request.content_length,
         )
-
+        headers = filtered_request_headers(request.headers, transformed=transformed)
+        headers.popall("X-Ollama-Proxy-Passthrough", None)
+        upstream_url = self.upstream + request.raw_path
+        forwarding_response = False
         try:
             async with self.session.request(
                 request.method,
                 upstream_url,
-                headers=request_headers,
+                headers=headers,
                 data=upstream_body if upstream_body else None,
                 allow_redirects=False,
             ) as upstream_response:
                 if transformed:
-                    return await self._handle_transformed(
-                        request,
-                        upstream_response,
-                    )
-                return await self._handle_passthrough(
-                    request,
-                    upstream_response,
-                )
-        except ClientError as exc:
-            LOG.exception("upstream request failed")
+                    return await self._handle_transformed(request, upstream_response)
+                forwarding_response = True
+                return await self._handle_passthrough(request, upstream_response)
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+            LOG.debug("client disconnected while proxying %s", request.raw_path)
+            raise
+        except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            LOG.warning("upstream failed on %s: %r", request.raw_path, exc)
+            if forwarding_response:
+                # Headers may already be on the wire. The only honest outcome
+                # for a broken stream is to terminate the connection.
+                raise
             return web.json_response(
-                {"error": f"Ollama upstream request failed: {exc}"},
+                {"error": f"Ollama upstream request failed: {exc}"}, status=502
+            )
+        finally:
+            # Async generator close releases the spool if upstream refused the
+            # request before consuming the complete upload.
+            if hasattr(upstream_body, "aclose"):
+                with suppress(Exception):
+                    await upstream_body.aclose()
+            if owned_spool is not None:
+                owned_spool.close()
+
+    async def _handle_transformed(
+        self, request: web.Request, upstream_response: Any
+    ) -> web.Response:
+        parts: list[bytes] = []
+        body_size = 0
+        async for chunk in upstream_response.content.iter_chunked(64 * 1024):
+            body_size += len(chunk)
+            if self.max_aggregate_response and body_size > self.max_aggregate_response:
+                return web.json_response(
+                    {"error": "Upstream streaming response exceeds aggregation limit"},
+                    status=502,
+                )
+            parts.append(chunk)
+        body = b"".join(parts)
+        status = upstream_response.status
+        content_type = upstream_response.headers.get("Content-Type", "")
+
+        if status >= 400 or status in (204, 205, 304) or request.method == "HEAD":
+            # An error (or no-body response) is already non-streaming: retain
+            # its original headers, including content-encoding if any.
+            return web.Response(
+                status=status,
+                reason=upstream_response.reason,
+                headers=filtered_response_headers(upstream_response.headers, transformed=False),
+                body=body,
+            )
+
+        encoding = upstream_response.headers.get("Content-Encoding", "identity").lower()
+        try:
+            if encoding == "gzip":
+                body = gzip.decompress(body)
+            elif encoding == "deflate":
+                body = zlib.decompress(body)
+            elif encoding not in ("identity", ""):
+                raise ValueError(f"unsupported upstream Content-Encoding: {encoding}")
+        except (OSError, ValueError, zlib.error) as exc:
+            return web.json_response(
+                {"error": f"Could not decompress upstream response: {exc}"},
                 status=502,
             )
 
-    async def _handle_transformed(
-        self,
-        request: web.Request,
-        upstream_response: Any,
-    ) -> web.Response:
-        body = await upstream_response.read()
-        headers = filtered_response_headers(
-            upstream_response.headers,
-            transformed=True,
-        )
-
-        # Preserve ordinary upstream errors exactly. They are already normal
-        # JSON responses rather than successful streaming responses.
-        if upstream_response.status >= 400:
-            content_type = upstream_response.headers.get(
-                "Content-Type",
-                "application/json",
-            )
-            headers["Content-Type"] = content_type
-            return web.Response(
-                status=upstream_response.status,
-                reason=upstream_response.reason,
-                headers=headers,
-                body=body,
-            )
-
-        content_type = upstream_response.headers.get("Content-Type", "")
-
-        # An endpoint may ignore stream=true and return an ordinary JSON body.
-        # In that case no reconstruction is necessary.
+        headers = filtered_response_headers(upstream_response.headers, transformed=True)
         media_type = content_type.split(";", 1)[0].strip().lower()
         if media_type == "application/json":
-            headers["Content-Type"] = content_type or "application/json"
-            return web.Response(
-                status=upstream_response.status,
-                reason=upstream_response.reason,
-                headers=headers,
-                body=body,
-            )
+            # Upstream ignored stream:true and returned a complete JSON object.
+            headers["Content-Type"] = content_type
+            return web.Response(status=status, headers=headers, body=body)
 
         try:
-            result = aggregate_streamed_response(
-                request.path,
-                content_type,
-                body,
-            )
+            result = aggregate_streamed_response(request.path, content_type, body)
         except RuntimeError as exc:
-            # Ollama reports mid-stream failures as a JSON object inside a 200
-            # stream because the HTTP status was already sent. A non-streaming
-            # caller must instead receive a regular error response.
-            LOG.error("upstream generation failed: %s", exc)
-            return web.json_response(
-                {"error": str(exc)},
-                status=500,
-                headers=headers,
-            )
+            LOG.warning("upstream streamed an error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
         except (ValueError, TypeError, KeyError) as exc:
-            LOG.exception("could not reconstruct upstream stream")
+            LOG.warning("cannot reconstruct %s: %s", request.path, exc)
             return web.json_response(
                 {"error": f"Could not reconstruct Ollama stream: {exc}"},
                 status=502,
-                headers=headers,
             )
 
         return web.Response(
-            status=upstream_response.status,
+            status=status,
             reason=upstream_response.reason,
             headers=headers,
             body=compact_json_bytes(result),
@@ -712,30 +894,43 @@ class OllamaProxy:
         )
 
     async def _handle_passthrough(
-        self,
-        request: web.Request,
-        upstream_response: Any,
+        self, request: web.Request, upstream_response: Any
     ) -> web.StreamResponse:
-        headers = filtered_response_headers(
-            upstream_response.headers,
-            transformed=False,
-        )
         response = web.StreamResponse(
             status=upstream_response.status,
             reason=upstream_response.reason,
-            headers=headers,
+            headers=filtered_response_headers(upstream_response.headers, transformed=False),
         )
         await response.prepare(request)
-
-        if request.method != "HEAD":
-            async for chunk in upstream_response.content.iter_any():
-                await response.write(chunk)
-        await response.write_eof()
+        try:
+            if request.method != "HEAD":
+                async for chunk in upstream_response.content.iter_any():
+                    await response.write(chunk)
+            await response.write_eof()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            # Never try to send a new JSON error response after headers.
+            LOG.debug("stream interrupted by disconnect: %s", request.raw_path)
+            raise
         return response
 
 
-def build_app(upstream: str) -> web.Application:
-    proxy = OllamaProxy(upstream)
+def build_app(
+    upstream: str,
+    *,
+    pool_limit: int = 0,
+    connect_timeout: float = 30,
+    max_buffered_request: int = 1024**3,
+    max_aggregate_response: int = 128 * 1024**2,
+    max_transform_request: int = 64 * 1024**2,
+) -> web.Application:
+    proxy = OllamaProxy(
+        upstream,
+        pool_limit=pool_limit,
+        connect_timeout=connect_timeout,
+        max_buffered_request=max_buffered_request,
+        max_aggregate_response=max_aggregate_response,
+        max_transform_request=max_transform_request,
+    )
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(proxy.start)
     app.on_cleanup.append(proxy.stop)
@@ -762,6 +957,31 @@ def parse_args() -> argparse.Namespace:
         help="listen port (default: %(default)s)",
     )
     parser.add_argument(
+        "--pool-limit", type=int,
+        default=int(os.environ.get("UPSTREAM_POOL_LIMIT", "0")),
+        help="maximum simultaneous upstream connections (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--connect-timeout", type=float,
+        default=float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "30")),
+        help="timeout for establishing new upstream sockets, seconds",
+    )
+    parser.add_argument(
+        "--max-buffered-request", type=int,
+        default=int(os.environ.get("MAX_BUFFERED_REQUEST", str(1024**3))),
+        help="max bytes to spool before stream mode is determined (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--max-aggregate-response", type=int,
+        default=int(os.environ.get("MAX_AGGREGATE_RESPONSE", str(128*1024**2))),
+        help="maximum upstream bytes for rebuilding a non-streaming response",
+    )
+    parser.add_argument(
+        "--max-transform-request", type=int,
+        default=int(os.environ.get("MAX_TRANSFORM_REQUEST", str(64*1024**2))),
+        help="maximum size of stream:false request JSON eligible for transformation",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.environ.get("LOG_LEVEL", "INFO"),
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -778,7 +998,14 @@ def main() -> None:
     )
     LOG.info("proxying http://%s:%d -> %s", args.host, args.port, args.upstream)
     web.run_app(
-        build_app(args.upstream),
+        build_app(
+            args.upstream,
+            pool_limit=args.pool_limit,
+            connect_timeout=args.connect_timeout,
+            max_buffered_request=args.max_buffered_request,
+            max_aggregate_response=args.max_aggregate_response,
+            max_transform_request=args.max_transform_request,
+        ),
         host=args.host,
         port=args.port,
         access_log=LOG,
@@ -787,3 +1014,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -452,7 +452,18 @@ class OllamaMessageRepeatProxy:
                         f"cancel job {job_id} failed with HTTP "
                         f"{cancel_response.status}: {response_text[:500]}"
                     )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        except asyncio.TimeoutError:
+            # The streaming connection is already closed. Do not block the next
+            # generation solely because the cancellation ACK did not arrive.
+            logger.warning(
+                "Job %s cancellation timed out after %.1fs; "
+                "connection dropped, proceeding without confirmation",
+                job_id,
+                timeout,
+            )
+            response.close()
+            return
+        except (aiohttp.ClientError, OSError) as exc:
             raise RuntimeError(
                 f"failed waiting for target job {job_id} cancellation: {exc}"
             ) from exc

@@ -1492,7 +1492,7 @@ class ModelManager:
             job.finished_event.set()
             self.condition.notify_all()
 
-    async def cancel_job(self, job_id: int, *, timeout: float = 35.0) -> bool:
+    async def cancel_job(self, job_id: int, *, timeout: float = 600.0) -> bool:
         """Cancel one internal generation and wait until its slot/job is released.
 
         Returns True when the job existed. A missing job is treated as already
